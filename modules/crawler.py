@@ -11,6 +11,11 @@ from config.crawler import FILE_TYPE_BLACKLIST, SCHEME_BLACKLIST, MAX_WORKERS
 from config.requests import BAIDU_SPIDER_HEADERS, NORMAL_HEADERS
 from modules.http_client import http_get
 
+# 百度蜘蛛 UA 自适应回退：连续失败 _SPIDER_FAIL_THRESHOLD 次后，
+# 本次任务后续请求直接使用普通 UA，避免每页都浪费一次无效请求。
+_spider_fail_count = 0
+_SPIDER_FAIL_THRESHOLD = 3
+
 
 class _LinkParser(HTMLParser):
     def __init__(self):
@@ -44,11 +49,32 @@ def _normalize_url(url):
 
 
 def _get_html(url):
+    global _spider_fail_count
     try:
-        resp = http_get(url, headers=BAIDU_SPIDER_HEADERS)
-        if resp.status_code != 200:
+        if _spider_fail_count < _SPIDER_FAIL_THRESHOLD:
+            resp = http_get(url, headers=BAIDU_SPIDER_HEADERS)
+            if resp.status_code != 200:
+                _spider_fail_count += 1
+                resp = http_get(url, headers=NORMAL_HEADERS)
+            else:
+                _spider_fail_count = max(0, _spider_fail_count - 1)
+        else:
             resp = http_get(url, headers=NORMAL_HEADERS)
-        return resp.status_code, resp.text, _md5(resp.content)
+
+        # 编码智能修复：当 response 声明的编码与 chardet 探测的实际编码不一致时，
+        # 直接从原始字节按探测到的真实编码解码。旧的 encode(声明)→decode(真实) 方案
+        # 在声明编码与原始字节不匹配时会引入不可逆的乱码（surrogateescape 后 decode 失败）。
+        try:
+            body = resp.text
+            enc_declared = resp.encoding
+            enc_detected = resp.apparent_encoding
+            if enc_declared and enc_detected and enc_declared.lower() != enc_detected.lower():
+                # resp.content 是原始字节，直接用 chardet 推测的真实编码解码
+                body = resp.content.decode(enc_detected, errors='replace')
+        except Exception:
+            body = resp.text
+
+        return resp.status_code, body, _md5(resp.content)
     except Exception:
         return 'Timeout', 'Timeout', ''
 
@@ -93,9 +119,17 @@ def crawl_links(page_url, task_root, white_domains=None):
     out_link = []
     in_link = []
 
-    status_code, html_text, _ = _get_html(page_url)
+    status_code, html_text, hash_val = _get_html(page_url)
     if html_text == 'Timeout':
-        return [], [[_normalize_url(page_url), [_normalize_url(page_url)]]]
+        return [], [[_normalize_url(page_url), [_normalize_url(page_url)]]], None
+
+    page_data = {
+        'url': _normalize_url(page_url),
+        'status_code': status_code,
+        'master': [_normalize_url(page_url)],
+        'html': html_text,
+        'hash': hash_val,
+    }
 
     raw_links, base_href = _extract_raw_links(html_text)
 
@@ -126,7 +160,7 @@ def crawl_links(page_url, task_root, white_domains=None):
     for url in sorted(set(in_link)):
         res_in.append([url, [page_url_norm]])
 
-    return res_out, res_in
+    return res_out, res_in, page_data
 
 
 def fetch_page_data(url, master):

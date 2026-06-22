@@ -33,14 +33,18 @@ def run_task(task_url, task_type='HomePage_Scan'):
 
 
 def _task_homepage(task_url, rule_snapshot):
-    res_out, _ = crawl_links(task_url, task_url, white_domains=rule_snapshot['white_domains'])
+    res_out, _, page_data = crawl_links(task_url, task_url, white_domains=rule_snapshot['white_domains'])
     print(f'* [INFO] 主页扫描 外链总数：{len(res_out)}')
-    webdata = collect_web_data(res_out + [[task_url, [task_url]]])
+    webdata = collect_web_data(res_out)
+    if page_data:
+        webdata.insert(0, page_data)
+    else:
+        webdata.insert(0, {'url': task_url, 'status_code': 'Timeout', 'master': [task_url], 'html': 'Timeout', 'hash': ''})
     return build_response(webdata, task_url, 'HomePage_Scan', rule_snapshot=rule_snapshot)
 
 
 def _task_secondpage(task_url, rule_snapshot):
-    res_out_home, res_in_home = crawl_links(task_url, task_url, white_domains=rule_snapshot['white_domains'])
+    res_out_home, res_in_home, _ = crawl_links(task_url, task_url, white_domains=rule_snapshot['white_domains'])
 
     combined_out = list(res_out_home)
     combined_in = []
@@ -51,7 +55,7 @@ def _task_secondpage(task_url, rule_snapshot):
         if in_url in visited:
             continue
         visited.add(in_url)
-        out_l, in_l = crawl_links(in_url, task_url, white_domains=rule_snapshot['white_domains'])
+        out_l, in_l, _ = crawl_links(in_url, task_url, white_domains=rule_snapshot['white_domains'])
         combined_out.extend(out_l)
         combined_in.extend(in_l)
         if len(visited) >= MAX_SECONDPAGE_PAGES:
@@ -68,6 +72,7 @@ def _task_allsite(task_url, rule_snapshot):
     queue = deque([task_url])
     visited = set()
     links_for_fetch = []
+    seen_fetch_urls = set()
 
     while queue and len(visited) < MAX_ALLSITE_PAGES:
         current = queue.popleft()
@@ -75,9 +80,13 @@ def _task_allsite(task_url, rule_snapshot):
             continue
         visited.add(current)
 
-        out_l, in_l = crawl_links(current, task_url, white_domains=rule_snapshot['white_domains'])
-        links_for_fetch.extend(out_l)
-        links_for_fetch.extend(in_l)
+        out_l, in_l, _ = crawl_links(current, task_url, white_domains=rule_snapshot['white_domains'])
+
+        for item in out_l + in_l:
+            url = item[0]
+            if url not in seen_fetch_urls:
+                seen_fetch_urls.add(url)
+                links_for_fetch.append(item)
 
         for in_item in in_l:
             in_url = in_item[0]
@@ -97,9 +106,13 @@ def _task_custompage(task_url, rule_snapshot):
         return {'taskurl': task_url, 'tasktype': 'CustomPage_Scan', 'status': 'error: invalid url'}
 
     base_url = tmp[0] + '//' + tmp[1].split('/', 1)[0]
-    res_out, _ = crawl_links(task_url, base_url, white_domains=rule_snapshot['white_domains'])
+    res_out, _, page_data = crawl_links(task_url, base_url, white_domains=rule_snapshot['white_domains'])
     print(f'* [INFO] 自定义页面扫描 外链总数：{len(res_out)}')
-    webdata = collect_web_data(res_out + [[task_url, [task_url]]])
+    webdata = collect_web_data(res_out)
+    if page_data:
+        webdata.insert(0, page_data)
+    else:
+        webdata.insert(0, {'url': task_url, 'status_code': 'Timeout', 'master': [task_url], 'html': 'Timeout', 'hash': ''})
     return build_response(webdata, task_url, 'CustomPage_Scan', rule_snapshot=rule_snapshot)
 
 

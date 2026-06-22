@@ -6,9 +6,11 @@ import html
 import hashlib
 import re
 from urllib.parse import unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from uuid import uuid4
 
 from config.detection import MIN_SHORT_TOKEN_HITS, MAX_BACKDOOR_PROBES, MAX_BACKDOOR_SECONDARY_CHECKS
+from config.crawler import MAX_WORKERS
 from config.requests import NORMAL_HEADERS
 from modules.http_client import http_get
 
@@ -77,19 +79,26 @@ def _backdoor_confidence(score):
 
 
 def _is_probably_malicious_script_hit(mark, snippet):
+    """加权打分判定脚本命中是否可信，替代原先的严格 AND 逻辑。"""
     if mark not in ('恶意代码混淆', '高风险脚本混淆跳转'):
         return True
 
     txt = (snippet or '').lower()
-    has_obfuscation = any(token in txt for token in (
+    score = 0
+
+    # 混淆特征
+    if any(token in txt for token in (
         'fromcharcode',
         'eval(',
         'atob(',
         'unescape(',
         'decodeuricomponent',
         'base64',
-    ))
-    has_danger_action = any(token in txt for token in (
+    )):
+        score += 2
+
+    # 危险操作
+    if any(token in txt for token in (
         'document.write',
         'innerhtml',
         'window.location',
@@ -98,37 +107,72 @@ def _is_probably_malicious_script_hit(mark, snippet):
         'display:none',
         'visibility:hidden',
         'opacity:0',
-    ))
-    has_external_or_encoded = bool(re.search(
-        r'https?://|%[0-9a-f]{2}|&#x[0-9a-f]+;|&#\\d+;',
+    )):
+        score += 2
+
+    # 外链或编码内容
+    if bool(re.search(
+        r'https?://|%[0-9a-f]{2}|&#x[0-9a-f]+;|&#\d+;',
         txt,
         re.I,
-    ))
-    return has_obfuscation and has_danger_action and has_external_or_encoded
+    )):
+        score += 2
+
+    # 总得分 ≥ 3 即可通过，允许只有外链+危险操作但无混淆的情况
+    return score >= 3
+
+
+def _match_rules_in_context(context, rules, seen, hits, max_snippet_len=300):
+    """在单个上下文中匹配规则集，去重结果直接追加到 hits 列表。"""
+    for pattern, mark, severity in rules:
+        try:
+            found = re.findall(pattern, context, re.I | re.S)
+        except re.error:
+            continue
+        for item in found:
+            snippet = item if isinstance(item, str) else ''.join(item)
+            snippet = html.unescape(snippet)
+            if len(snippet) > max_snippet_len:
+                snippet = snippet[:max_snippet_len] + '...'
+            if not _is_probably_malicious_script_hit(mark, snippet):
+                continue
+            key = (mark, snippet)
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append({'mark': mark, 'snippet': snippet, 'severity': int(severity or 2)})
 
 
 def blacklink_find(htmltxt, rules):
-    contexts = _build_contexts(htmltxt)
+    if not rules:
+        return [], 'low'
+
+    # 规则分流：包含 <script 的规则只匹配 script 标签内部，其余规则全页匹配
+    script_rules = [r for r in rules if '<script' in r[0].lower()]
+    general_rules = [r for r in rules if '<script' not in r[0].lower()]
+
     hits = []
     seen = set()
-    for pattern, mark, severity in rules:
+
+    # --- 全页规则：保持原有逻辑，在整页解码上下文中匹配 ---
+    if general_rules:
+        contexts = _build_contexts(htmltxt)
         for ctx in contexts:
-            try:
-                found = re.findall(pattern, ctx, re.I | re.S)
-            except re.error:
+            _match_rules_in_context(ctx, general_rules, seen, hits)
+
+    # --- Script 类规则：提取所有 <script> 标签，逐标签独立匹配 ---
+    if script_rules:
+        # 从原始 HTML 中提取所有 script 标签内容
+        script_tags = re.findall(r'(<script[\s\S]*?</script>)', htmltxt, re.I | re.S)
+        for tag in script_tags:
+            # 跳过超长 script 标签（Libra 做法，>9999 字符的多为第三方库而非恶意代码）
+            if len(tag) > 9999:
                 continue
-            for item in found:
-                snippet = item if isinstance(item, str) else ''.join(item)
-                snippet = html.unescape(snippet)
-                if len(snippet) > 300:
-                    snippet = snippet[:300] + '...'
-                if not _is_probably_malicious_script_hit(mark, snippet):
-                    continue
-                key = (mark, snippet)
-                if key in seen:
-                    continue
-                seen.add(key)
-                hits.append({'mark': mark, 'snippet': snippet, 'severity': int(severity or 2)})
+            # 每个 script 标签独立走解码管道
+            script_contexts = _build_contexts(tag)
+            for ctx in script_contexts:
+                _match_rules_in_context(ctx, script_rules, seen, hits)
+
     return hits, _confidence(hits)
 
 
@@ -147,9 +191,14 @@ def violative_find(htmltxt, rules):
                 seen.add(key)
                 hit_count = len(found)
                 total_occurrences += hit_count
+                # 取第一条实际匹配文本作为 snippet（截断到 120 字符），
+                # 比输出正则模式本身对用户更有诊断价值。
+                first_match = found[0]
+                snippet = first_match if isinstance(first_match, str) else ''.join(first_match)
+                snippet = snippet[:120]
                 hits.append({
                     'mark': mark,
-                    'snippet': pattern,
+                    'snippet': snippet,
                     'severity': int(severity or 2),
                     'count': hit_count,
                 })
@@ -193,10 +242,13 @@ def _short_title(text):
 def _page_signature(status_code, body):
     title = _short_title(body)
     body_norm = _normalize_text(body).lower()
-    token = re.sub(r'\s+', ' ', body_norm[:3000])
-    digest = hashlib.md5(token.encode('utf-8', errors='ignore')).hexdigest()
-    length_bucket = len(body_norm) // 200
-    return f'{status_code}|{title}|{length_bucket}|{digest[:12]}'
+    # 取页面头部 2000 字符 + 尾部 1000 字符做 MD5，
+    # 比仅取前 3000 字符更好地区分同模板但内容不同的页面。
+    head = re.sub(r'\s+', ' ', body_norm[:2000])
+    tail = re.sub(r'\s+', ' ', body_norm[-1000:]) if len(body_norm) > 2000 else ''
+    combined = f'{head}|{tail}'
+    digest = hashlib.md5(combined.encode('utf-8', errors='ignore')).hexdigest()
+    return f'{status_code}|{title}|{digest}'
 
 
 def _backdoor_score(body, status_code, match_count):
@@ -224,8 +276,11 @@ def _backdoor_score(body, status_code, match_count):
         score += 2
     if any(k in text for k in ('cmd=', 'password=', 'execute', 'webshell', 'r57', 'c99', 'd99')):
         score += 2
-    if any(k in text for k in ('404', 'not found', '页面不存在', '访问被拒绝', '请先登录')):
-        score -= 2
+    error_signals = ('404', 'not found', '页面不存在', '访问被拒绝', '请先登录',
+                     'forbidden', 'access denied', 'unauthorized', '无权限')
+    if any(k in text for k in error_signals):
+        if score < 5:           # 强后门特征（score≥5）不受错误页误报影响
+            score -= 2
     return score
 
 
@@ -257,16 +312,24 @@ def backdoor_find(base_url, rules, paths):
     page_cache = {}
     secondary_checks = 0
 
-    # 单路径单请求，避免旧逻辑对每条规则重复请求同一路径造成噪声和性能浪费。
-    for path in paths[:MAX_BACKDOOR_PROBES]:
-        probe_url = f'{base_url.rstrip("/")}{path}'
-        status_code, body = _http_get_text(probe_url)
-        if status_code == 0 or not body or not _should_probe_status(status_code, body):
-            continue
-        sig = _page_signature(status_code, body)
-        template_signatures[sig] = template_signatures.get(sig, 0) + 1
-        page_cache[probe_url] = (status_code, body, sig)
+    # 并发探测所有后门路径，大幅缩短串行等待时间。
+    probe_targets = [f'{base_url.rstrip("/")}{path}' for path in paths[:MAX_BACKDOOR_PROBES]]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {executor.submit(_http_get_text, url): url for url in probe_targets}
+        for future in as_completed(future_map):
+            probe_url = future_map[future]
+            try:
+                status_code, body = future.result()
+            except Exception:
+                continue
+            if status_code == 0 or not body or not _should_probe_status(status_code, body):
+                continue
+            sig = _page_signature(status_code, body)
+            template_signatures[sig] = template_signatures.get(sig, 0) + 1
+            page_cache[probe_url] = (status_code, body, sig)
 
+    # 第一遍：收集所有命中及其 score，不带二次验证
+    raw_candidates = []
     for probe_url, (status_code, body, sig) in page_cache.items():
         for pattern, mark, severity in rules:
             try:
@@ -281,23 +344,45 @@ def backdoor_find(base_url, rules, paths):
                 continue
 
             score = _backdoor_score(body, status_code, len(found))
-            if secondary_checks < MAX_BACKDOOR_SECONDARY_CHECKS:
-                score += _secondary_verify(probe_url, pattern)
-                secondary_checks += 1
             conf = _backdoor_confidence(score)
             if conf == 'low':
                 continue
 
-            key = (mark, probe_url)
-            if key in seen:
-                continue
-            seen.add(key)
-            hits.append({
+            raw_candidates.append({
+                'probe_url': probe_url,
+                'pattern': pattern,
                 'mark': mark,
-                'snippet': f'{probe_url} (score={score},conf={conf})',
                 'severity': int(severity or 3),
-                'confidence': conf,
+                'score': score,
+                'conf': conf,
             })
+
+    # 按 score 降序排序，将最可疑的条目排在前面
+    raw_candidates.sort(key=lambda x: x['score'], reverse=True)
+
+    # 第二遍：对高分条目优先做二次验证 (上限 MAX_BACKDOOR_SECONDARY_CHECKS)
+    for cand in raw_candidates:
+        key = (cand['mark'], cand['probe_url'])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        final_score = cand['score']
+        if secondary_checks < MAX_BACKDOOR_SECONDARY_CHECKS:
+            delta = _secondary_verify(cand['probe_url'], cand['pattern'])
+            final_score += delta
+            secondary_checks += 1
+
+        final_conf = _backdoor_confidence(final_score)
+        if final_conf == 'low':
+            continue
+
+        hits.append({
+            'mark': cand['mark'],
+            'snippet': f'{cand["probe_url"]} (score={final_score},conf={final_conf})',
+            'severity': cand['severity'],
+            'confidence': final_conf,
+        })
 
     if not hits:
         return [], 'low'

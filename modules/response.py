@@ -4,6 +4,7 @@
 import json
 import hashlib
 from pathlib import Path
+from urllib.parse import urlparse
 
 from config.logging import log_data
 from config.detection import MIN_CONFIDENCE
@@ -54,7 +55,9 @@ def _top_issue_urls(data, topn=5):
 def _overall_risk(data):
     high_cnt = _count_conf(data['blacklink_list'], 'high') + _count_conf(data['violativelink_list'], 'high') + _count_conf(data['backdoor_list'], 'high')
     medium_cnt = _count_conf(data['blacklink_list'], 'medium') + _count_conf(data['violativelink_list'], 'medium') + _count_conf(data['backdoor_list'], 'medium')
-    if high_cnt > 0 or len(data['backdoor_list']) > 0:
+    # 后门告警只计 medium 及以上，避免低置信度误报拉高风险等级
+    backdoor_medium_or_above = sum(1 for item in data['backdoor_list'] if item.get('confidence') in ('medium', 'high'))
+    if high_cnt > 0 or backdoor_medium_or_above > 0:
         return 'high'
     if medium_cnt > 0:
         return 'medium'
@@ -88,7 +91,12 @@ def _summary_lines(data):
         _count_conf(data['backdoor_list'], 'medium'),
         _uniq_urls(data['backdoor_list']),
     ))
-    lines.append('死链数量：{} (URL:{})'.format(len(data['diedlink_list']), _uniq_urls(data['diedlink_list'])))
+    # 为死链统计增加超时与 HTTP 错误分布
+    dead_timeout = sum(1 for d in data['diedlink_list'] if d.get('dead_link_type') == 'timeout_or_error')
+    dead_http = len(data['diedlink_list']) - dead_timeout
+    lines.append('死链数量：{} (URL:{}) [超时:{} HTTP错误:{}]'.format(
+        len(data['diedlink_list']), _uniq_urls(data['diedlink_list']), dead_timeout, dead_http,
+    ))
     top_urls = _top_issue_urls(data)
     if top_urls:
         lines.append('问题URL Top{}:'.format(len(top_urls)))
@@ -155,8 +163,11 @@ def _detail_lines(data):
         lines.append('### 死链检测结果\n')
         lines.append('```')
         for item in data['diedlink_list']:
+            status = item['status_code']
+            link_type = item.get('dead_link_type', 'unknown')
             lines.append('问题地址：\n' + item['url'])
-            lines.append('访问状态：\n' + str(item['status_code']))
+            lines.append('访问状态：\n' + str(status))
+            lines.append('死链类型：\n' + link_type)
             lines.append('来源地址：')
             for src in item['master']:
                 lines.append(src)
@@ -227,25 +238,61 @@ def build_response(webdata, task_url, task_type, rule_snapshot=None):
     backdoor_rules = rule_snapshot['backdoor_rules']
     backdoor_paths = rule_snapshot['backdoor_paths']
 
-    backdoor_hits, backdoor_conf = backdoor_find(task_url, backdoor_rules, backdoor_paths)
-    if backdoor_hits:
+    # 收集爬虫发现的内链所在目录，扩展后门探测覆盖面。
+    # 例如站点有 /blog/ 和 /admin/ 目录，分别做路径探测。
+    backdoor_bases = {task_url}
+    task_host = (urlparse(task_url).hostname or '').lower()
+    for page in webdata:
+        if page.get('status_code') != 200:
+            continue
+        page_host = (urlparse(page['url']).hostname or '').lower()
+        if page_host != task_host:
+            continue
+        parsed = urlparse(page['url'])
+        path = parsed.path.rstrip('/')
+        if '/' in path:
+            dir_url = f'{parsed.scheme}://{parsed.netloc}{path.rsplit("/", 1)[0]}'
+            backdoor_bases.add(dir_url)
+
+    # 上限：根 URL + 最多 4 个子目录，避免请求爆炸
+    backdoor_bases = sorted(backdoor_bases)[:5]
+
+    all_backdoor_hits = []
+    all_backdoor_conf = 'low'
+    for base_url in backdoor_bases:
+        bhits, bconf = backdoor_find(base_url, backdoor_rules, backdoor_paths)
+        if bhits:
+            # 将归属目录写入 master，方便定位
+            for hit in bhits:
+                hit.setdefault('base', base_url)
+            all_backdoor_hits.extend(bhits)
+            if bconf == 'high':
+                all_backdoor_conf = 'high'
+            elif bconf == 'medium' and all_backdoor_conf != 'high':
+                all_backdoor_conf = 'medium'
+
+    if all_backdoor_hits:
         backdoor_list.append({
             'type': 'backdoor',
             'url': task_url,
-            'confidence': backdoor_conf,
-            'backdoorres': _format_hits(backdoor_hits),
+            'confidence': all_backdoor_conf,
+            'backdoorres': _format_hits(all_backdoor_hits),
             'master': [task_url],
-            'fingerprint': _finding_fingerprint('backdoor', task_url, backdoor_conf, _format_hits(backdoor_hits)),
+            'fingerprint': _finding_fingerprint('backdoor', task_url, all_backdoor_conf, _format_hits(all_backdoor_hits)),
         })
 
     for page in webdata:
         if page['status_code'] != 200:
+            # 区分超时/连接错误 与 真实的 HTTP 状态码死链
+            status = page['status_code']
+            dead_link_type = 'timeout_or_error' if isinstance(status, str) and status == 'Timeout' else 'http_error'
             dead_links.append({
                 'type': 'deadlink',
                 'url': page['url'],
-                'status_code': page['status_code'],
+                'status_code': status,
+                'dead_link_type': dead_link_type,
                 'master': page['master'],
-                'fingerprint': _finding_fingerprint('deadlink', page['url'], str(page['status_code']), [str(page['status_code'])]),
+                'fingerprint': _finding_fingerprint('deadlink', page['url'], str(status), [str(status)]),
             })
 
         violative_hits, violative_conf = violative_find(page['html'], violative_rules)
