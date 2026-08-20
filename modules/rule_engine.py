@@ -15,15 +15,27 @@ from config.requests import NORMAL_HEADERS
 from modules.http_client import http_get
 
 
+def _decode_js_escapes(text):
+    """只解码 JS 风格的 \\uXXXX / \\xNN 转义序列。
+
+    不能对整段文本做 unicode_escape 解码：那会把 UTF-8 中文字节当成
+    latin-1 逐字节解释，中文全部变成乱码，敏感词永远匹配不上。
+    """
+    def _sub(m):
+        try:
+            return m.group(0).encode('ascii').decode('unicode_escape')
+        except Exception:
+            return m.group(0)
+
+    return re.sub(r'(?:\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2})+', _sub, text)
+
+
 def _normalize_text(content):
     txt = content or ''
     txt = html.unescape(txt)
     for _ in range(2):
         txt = unquote(txt)
-    try:
-        txt = txt.encode('utf-8', errors='ignore').decode('unicode_escape')
-    except Exception:
-        pass
+    txt = _decode_js_escapes(txt)
     return txt
 
 

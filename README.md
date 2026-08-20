@@ -232,29 +232,7 @@ reports/
 python3 -m pytest tests/ -v
 ```
 
----
 
-## 更新日志
-
-### v2.0（当前）
-- 集成 Libra 编码智能识别（`resp.content.decode(apparent_encoding)`）
-- Script 切片黑链检测 + 加权打分判定（替代 AND 逻辑）
-- 58 个 UA 池 + 百度蜘蛛自适应回退
-- 后门路径并发探测 + score 降序二次验证 + 子目录扩展
-- 首页抓取数据复用，避免重复 HTTP 请求
-- AllSite BFS 早期去重
-- 页面签名加盖尾部抽样
-- 死链分类（超时/HTTP 错误）+ 后门评分惩罚项增强
-- 违规 snippet 改为匹配文本（而非正则模式）
-
-### v1.0
-- 初始版本：lingjian 从 Libra fork，独立命名与入口
-- 规则引擎重构：severity/enabled、置信度、多上下文解码
-- 后门检测：多特征打分 + 二次验证 + 模板页抑制
-- 受控 BFS 全站扫描
-- 双格式报告输出
-
----
 
 ## 许可与免责
 

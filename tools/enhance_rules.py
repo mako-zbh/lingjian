@@ -8,17 +8,22 @@ DB = Path(__file__).resolve().parent.parent / 'lingjian.db'
 
 HIGH_PREC_BLACKLINK = [
     (
-        r'(<a[^>]+href=["\']https?://[^"\']+["\'][^>]*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden|opacity\\s*:\\s*0)[^>]*>)',
+        r'(<a[^>]+style=["\']?display\s*:\s*none["\']?[^>]*href=["\']https?://[^"\']+["\'])',
+        '隐藏外链',
+        3,
+    ),
+    (
+        r'(<a[^>]+href=["\']https?://[^"\']+["\'][^>]*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0)[^>]*>)',
         '隐藏样式外链',
         3,
     ),
     (
-        r'(<iframe[^>]+src=["\']https?://[^"\']+["\'][^>]*(?:width=["\']?0["\']?|height=["\']?0["\']?|display\\s*:\\s*none)[^>]*>)',
+        r'(<iframe[^>]+src=["\']https?://[^"\']+["\'][^>]*(?:width=["\']?0["\']?|height=["\']?0["\']?|display\s*:\s*none)[^>]*>)',
         '隐藏iframe外链',
         3,
     ),
     (
-        r'(<script[\\s\\S]{0,5000}?(?:eval\\(|atob\\(|fromCharCode\\()[\\s\\S]{0,5000}?(?:location\\.|document\\.write|innerHTML)[\\s\\S]{0,5000}?</script>)',
+        r'(<script[\s\S]{0,5000}?(?:eval\(|atob\(|fromCharCode\()[\s\S]{0,5000}?(?:location\.|document\.write|innerHTML)[\s\S]{0,5000}?</script>)',
         '高风险脚本混淆跳转',
         3,
     ),
@@ -31,7 +36,7 @@ HIGH_PREC_VIOLATIVE = [
 ]
 
 HIGH_PREC_BACKDOOR = [
-    (r'(?:eval\\(base64_decode|assert\\(\\$_POST|system\\(\\$_GET|passthru\\(|shell_exec\\()', '通用WebShell特征', 3),
+    (r'(?:eval\(base64_decode|assert\(\$_POST|system\(\$_GET|passthru\(|shell_exec\()', '通用WebShell特征', 3),
 ]
 
 EXTRA_BACKDOOR_PATHS = [
