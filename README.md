@@ -71,12 +71,14 @@ lingjian/
 │
 ├── tools/
 │   ├── enhance_rules.py         # 补充高精度规则（幂等插入）
+│   ├── merge_external_rules.py  # 合并外部开源词库（Hawkeye / Sensitive-lexicon，幂等）
 │   ├── migrate_from_libra.py    # 旧 Libra 数据库迁移
 │   └── common.py                # 时间工具
 │
 ├── tests/
 │   ├── test_crawler.py
-│   └── test_response.py
+│   ├── test_response.py
+│   └── test_rule_engine.py      # 规则引擎 + 规则库完整性回归测试
 │
 ├── reports/                     # 扫描报告输出目录（.md + .json）
 └── docs/
@@ -186,6 +188,9 @@ python3 tools/migrate_from_libra.py
 
 # 补充高精度规则（幂等插入，不会重复）
 python3 tools/enhance_rules.py
+
+# 合并外部开源词库（Hawkeye 暗链词表 + Sensitive-lexicon 分类词库，幂等）
+python3 tools/merge_external_rules.py
 ```
 
 数据库包含 5 张表：`blacklink_rules`、`backdoor_rules`、`backdoor_paths`、`violativelink_rules`、`whiteips`。所有规则均支持 `severity`（1-3）和 `enabled`（0/1）字段。
@@ -229,10 +234,16 @@ reports/
 ## 运行测试
 
 ```bash
-python3 -m pytest tests/ -v
+python3 -m unittest discover -s tests -v
 ```
 
 
+
+## 致谢
+
+- [rabbitmask/Libra](https://github.com/rabbitmask/Libra)（MIT）：本项目的前身，整体架构、检测流程与初始规则库（黑链/后门/违规规则约 1800 条）均源自该项目，并在此基础上做了深度优化。
+
+---
 
 ## 许可与免责
 
